@@ -1322,6 +1322,68 @@ def nyi(fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any) 
         raise AssertionError(f"NYI: {func}")
 
 
+def _determine_conv_memory_format(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    groups: int,
+    bias_sizes: list[int] | None = None,
+) -> torch.memory_format:
+    """Query the backend to determine the output memory format for a conv.
+
+    When all shapes are concrete, calls _select_conv_backend and
+    _conv_determine_backend_memory_format for an exact answer.  Falls back
+    to a strides-based heuristic for unbacked SymInts (where
+    _select_conv_backend cannot be called) or meta tensors (where it returns
+    Overrideable).
+    """
+    from torch.fx.experimental.symbolic_shapes import has_guarding_hint
+
+    all_hinted = all(has_guarding_hint(s) for s in input.shape) and all(
+        has_guarding_hint(s) for s in weight.shape
+    )
+
+    if all_hinted:
+        select_kwargs: dict[str, object] = dict(
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            transposed=transposed,
+            output_padding=output_padding,
+            groups=groups,
+        )
+        select_kwargs["bias"] = bias
+        if bias is None:
+            select_kwargs["bias_sizes"] = bias_sizes
+        conv_backend = torch._C._select_conv_backend(input, weight, **select_kwargs)
+
+        # pyrefly: ignore[missing-attribute]  (_ConvBackend is a C++ enum)
+        if conv_backend != torch._C._ConvBackend.Overrideable:
+            _input, _weight = input, weight
+            if weight.ndim == 3 and not input.is_mkldnn and not input.is_xpu:
+                _input = input.contiguous().unsqueeze(2)
+                _weight = weight.unsqueeze(2)
+            return torch._C._conv_determine_backend_memory_format(
+                _input, _weight, conv_backend
+            )
+
+    # Strides-based heuristic: used for unbacked SymInts and meta tensors.
+    # Real backends (cuDNN, MKL-DNN, MPS) produce channels_last output when
+    # either input or weight is channels_last.
+    input_fmt = torch._prims_common.suggest_memory_format(input)
+    weight_fmt = torch._prims_common.suggest_memory_format(weight)
+    if input_fmt == torch.channels_last or weight_fmt == torch.channels_last:
+        return torch.channels_last
+    if input_fmt == torch.channels_last_3d or weight_fmt == torch.channels_last_3d:
+        return torch.channels_last_3d
+    return input_fmt
+
+
 @register_op_impl([aten.convolution.default, aten.convolution_backward.default])
 def conv(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
@@ -1330,82 +1392,52 @@ def conv(
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
     device = new_kwargs["input"].fake_device
-    # need to re-enable mode so the tensors report fake device
     with fake_mode:
-        # if the input is unsqueezed is done in Convolution.cpp we get segfault
+        # convolution has "bias" but not "bias_sizes"; convolution_backward has
+        # "bias_sizes" but not "bias". .get() handles both ops with one call.
+        mem_fmt = _determine_conv_memory_format(
+            new_kwargs["input"],
+            new_kwargs["weight"],
+            new_kwargs.get("bias"),
+            new_kwargs["stride"],
+            new_kwargs["padding"],
+            new_kwargs["dilation"],
+            new_kwargs["transposed"],
+            new_kwargs["output_padding"],
+            new_kwargs["groups"],
+            new_kwargs.get("bias_sizes"),
+        )
+        # For conv1d (weight.ndim == 3), _determine_conv_memory_format expands to
+        # 2d internally, so mem_fmt reflects the 2d backend format.  Applying it
+        # to grad_weight via the 3d channels_last unsqueeze/squeeze trick naturally
+        # reproduces the strided weight layout (e.g. a transposed weight with
+        # non-contiguous strides).  For conv2d/3d the weight's own format is the
+        # right answer.
         k = new_kwargs["weight"].ndim
+        weight_fmt = (
+            mem_fmt
+            if k == 3
+            and not new_kwargs["input"].is_mkldnn
+            and not new_kwargs["input"].is_xpu
+            else torch._prims_common.suggest_memory_format(new_kwargs["weight"])
+        )
 
-        # Avoid importing sympy at a module level
-        from torch.fx.experimental.symbolic_shapes import has_guarding_hint
-
-        all_hinted = all(
-            has_guarding_hint(s) for s in new_kwargs["input"].shape
-        ) and all(has_guarding_hint(s) for s in new_kwargs["weight"].shape)
-
-        if not all_hinted:
-            # TODO: We can make this a little more faithful with best effort
-            # channels last detection (but only if it's statically obvious!)
-            mem_fmt = None
-        else:
-            if func is aten.convolution.default:
-                conv_backend = torch._C._select_conv_backend(**new_kwargs)
-            else:
-                conv_backend = torch._C._select_conv_backend(
-                    new_kwargs["input"],
-                    new_kwargs["weight"],
-                    bias=None,
-                    stride=new_kwargs["stride"],
-                    padding=new_kwargs["padding"],
-                    dilation=new_kwargs["dilation"],
-                    transposed=new_kwargs["transposed"],
-                    output_padding=new_kwargs["output_padding"],
-                    groups=new_kwargs["groups"],
-                    bias_sizes=new_kwargs["bias_sizes"],
-                )
-            # Expand 1d -> 2d.
-            # Note: Avoid expanding before calling _select_conv_backend,
-            # as the function handles 2D expansion internally.
-            if (
-                k == 3
-                and not new_kwargs["input"].is_mkldnn
-                and not new_kwargs["input"].is_xpu
-            ):
-                # Note: Using input.to(memory_format=contiguous) does not work.
-                new_kwargs["input"] = new_kwargs["input"].contiguous().unsqueeze(2)
-                new_kwargs["weight"] = new_kwargs["weight"].unsqueeze(2)
-                if len(new_kwargs["stride"]) == 1:
-                    new_kwargs["stride"].insert(0, 1)
-                    new_kwargs["padding"].insert(0, 0)
-                    new_kwargs["dilation"].insert(0, 1)
-                    new_kwargs["output_padding"].insert(0, 0)
-            mem_fmt = torch._C._conv_determine_backend_memory_format(
-                new_kwargs["input"], new_kwargs["weight"], conv_backend
-            )
-            # revert 2d -> 1d
-            if (
-                k == 3
-                and not new_kwargs["input"].is_mkldnn
-                and not new_kwargs["input"].is_xpu
-            ):
-                new_kwargs["input"] = new_kwargs["input"].squeeze(2)
-                new_kwargs["weight"] = new_kwargs["weight"].squeeze(2)
-                if len(new_kwargs["stride"]) == 2:
-                    new_kwargs["stride"].pop(0)
-                    new_kwargs["padding"].pop(0)
-                    new_kwargs["dilation"].pop(0)
-                    new_kwargs["output_padding"].pop(0)
-
-    def convert(
-        t: torch.Tensor | None, mem_fmt: torch.memory_format | None
-    ) -> FakeTensor | None:
+    def convert(t: torch.Tensor | None, fmt: torch.memory_format) -> FakeTensor | None:
         if t is None:
             return t
-        if mem_fmt is not None:
-            # channels last only support 4d, try to expand dim then convert it back later.
-            if t.dim() == 3 and mem_fmt == torch.channels_last:
-                t = t.unsqueeze(2).to(memory_format=mem_fmt).squeeze(2)
+        if fmt != torch.contiguous_format:
+            # channels_last requires 4d; expand to 4d, reformat, then squeeze back.
+            if t.dim() == 3 and fmt == torch.channels_last:
+                t = t.unsqueeze(2).to(memory_format=fmt).squeeze(2)
             else:
-                t = t.to(memory_format=mem_fmt)
+                t = t.to(memory_format=fmt)
+        elif torch._prims_common.suggest_memory_format(t) != torch.contiguous_format:
+            # The meta kernel may have set a non-contiguous format on this output
+            # (e.g. meta_convolution_backward sets channels_last on grad_weight)
+            # but the real backend will produce contiguous. Fix the strides here.
+            # We only do this when the tensor is not already contiguous to avoid
+            # triggering guards on unbacked SymInt shapes.
+            t = t.contiguous()
         return FakeTensor(fake_mode, t, device)
 
     with in_kernel_invocation_manager(fake_mode):
@@ -1416,8 +1448,8 @@ def conv(
         else:
             return (
                 convert(out[0], mem_fmt),
-                convert(out[1], mem_fmt),
-                convert(out[2], None),
+                convert(out[1], weight_fmt),
+                convert(out[2], torch.contiguous_format),
             )
 
 
