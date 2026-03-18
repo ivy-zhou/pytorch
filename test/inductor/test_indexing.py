@@ -614,6 +614,41 @@ class TestPrecomputedSizeHinting(InductorTestCase):
         self.assertEqual(hint, 53)
 
 
+class TestOptimizationHintZeroDivision(InductorTestCase):
+    """Test that optimization_hint handles ZeroDivisionError from ModularIndexing with zero-valued unbacked symbols."""
+
+    def test_modular_indexing_with_zero_divisor(self):
+        sizevars = SizeVarAllocator()
+        u0 = sizevars.shape_env.create_unbacked_symint().node.expr
+
+        # ModularIndexing(u0, u0, 4) — u0 appears as the divisor.
+        # With fallback=0, u0 is substituted with 0, triggering (0 // 0) % 4.
+        expr = ModularIndexing(u0, u0, 4)
+        hint = sizevars.optimization_hint(expr, fallback=0)
+        self.assertEqual(hint, 0)
+
+    def test_floor_div_with_zero_divisor(self):
+        """optimization_hint should not crash when FloorDiv has an unbacked
+        symbol as divisor that gets substituted with 0."""
+        sizevars = SizeVarAllocator()
+        u0 = sizevars.shape_env.create_unbacked_symint().node.expr
+
+        expr = FloorDiv(u0, u0)
+        # Should not raise; sympy resolves FloorDiv(0, 0) to 1
+        hint = sizevars.optimization_hint(expr, fallback=0)
+        self.assertEqual(hint, 1)
+
+    def test_modular_indexing_zero_divisor_nonzero_fallback(self):
+        """When fallback is nonzero, the hint should still not crash."""
+        sizevars = SizeVarAllocator()
+        u0 = sizevars.shape_env.create_unbacked_symint().node.expr
+
+        expr = ModularIndexing(u0, u0, 4)
+        hint = sizevars.optimization_hint(expr, fallback=8192)
+        # With fallback=8192, u0 maps to 8192, so (8192 // 8192) % 4 = 0
+        self.assertEqual(hint, 0)
+
+
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
 
